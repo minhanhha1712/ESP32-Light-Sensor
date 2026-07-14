@@ -1,0 +1,983 @@
+/*
+  ESP32 Air Dust + Solar Light Logger Web Server
+  Hardware:
+  - ESP32 38 pin
+  - BME280 I2C
+  - TSL2591 I2C
+  - OLED SSD1306 0.96 inch I2C
+  - PMS7003 UART
+  - MicroSD SPI
+
+  Functions:
+  - OLED realtime update every 1 second
+  - Web page realtime update through ESP32 AP IP
+  - Save CSV to MicroSD every 5 minutes
+  - Download CSV from web
+  - View last CSV rows from web
+
+  Wiring:
+  I2C SDA = GPIO21
+  I2C SCL = GPIO22
+
+  PMS7003 TXD -> ESP32 GPIO16 RX2
+  PMS7003 RXD -> ESP32 GPIO17 TX2
+  PMS7003 VCC -> 5V
+  PMS7003 GND -> GND
+
+  MicroSD CS   -> GPIO5
+  MicroSD SCK  -> GPIO18
+  MicroSD MISO -> GPIO19
+  MicroSD MOSI -> GPIO23
+
+  OLED/BME280/TSL2591 VCC -> 3V3
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+
+#include <Wire.h>
+#include <SPI.h>
+#include <SD.h>
+
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME280.h>
+#include <Adafruit_TSL2591.h>
+
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ================== WIFI AP CONFIG ==================
+const char *AP_SSID = "ESP32_AIR_LIGHT";
+const char *AP_PASS = "12345678";   // Mat khau toi thieu 8 ky tu
+
+WebServer server(80);
+
+// ================== ESP32 PINS ==================
+#define I2C_SDA 21
+#define I2C_SCL 22
+
+#define PMS_RX 16
+#define PMS_TX 17
+
+#define SD_CS   5
+#define SD_SCK  18
+#define SD_MISO 19
+#define SD_MOSI 23
+
+// ================== OLED ==================
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+bool oledOK = false;
+
+// ================== INTERVALS ==================
+const unsigned long DISPLAY_INTERVAL = 1000;               // OLED + sensor update every 1s
+const unsigned long LOG_INTERVAL = 5UL * 60UL * 1000UL;    // SD save every 5 minutes
+
+unsigned long lastDisplayTime = 0;
+unsigned long lastLogTime = 0;
+
+// ================== SD FILES ==================
+const char *DATA_FILE = "/data.csv";
+const char *SEQ_FILE  = "/seq.txt";
+
+unsigned long sampleIndex = 0;
+
+// ================== SENSORS ==================
+Adafruit_BME280 bme;
+Adafruit_TSL2591 tsl = Adafruit_TSL2591(2591);
+HardwareSerial PMS(2);
+
+bool bmeOK = false;
+bool tslOK = false;
+bool sdOK  = false;
+
+// ================== CURRENT DATA ==================
+float curTemp = NAN;
+float curHum  = NAN;
+float curPres = NAN;
+
+float curLux = -1;
+uint16_t curFull = 0;
+uint16_t curIR = 0;
+uint16_t curVisible = 0;
+
+struct PMSData {
+  uint16_t pm1_0;
+  uint16_t pm2_5;
+  uint16_t pm10;
+  bool valid;
+};
+
+PMSData curPMS;
+
+unsigned long lastSensorReadMs = 0;
+unsigned long lastSavedNo = 0;
+
+// ================== OLED SCROLL ==================
+// OLED 128x64 hien thi duoc khoang 6 dong text size 1.
+// Ta tao danh sach nhieu dong roi cho man hinh tu truot len/xuong de xem het thong tin.
+const unsigned long OLED_SCROLL_INTERVAL = 700;  // toc do cuon, ms
+unsigned long lastOledScrollTime = 0;
+int oledScrollLine = 0;
+const int OLED_VISIBLE_LINES = 6;
+const int OLED_TOTAL_LINES = 15;
+
+// ================== UTILS ==================
+String safeFloat(float v, uint8_t digits = 2) {
+  if (isnan(v)) return "NA";
+  return String(v, (unsigned int)digits);
+}
+
+String luxString(float v, uint8_t digits = 2) {
+  if (isnan(v) || v < 0) return "NA";
+  return String(v, (unsigned int)digits);
+}
+
+String htmlEscape(String s) {
+  s.replace("&", "&amp;");
+  s.replace("<", "&lt;");
+  s.replace(">", "&gt;");
+  s.replace("\"", "&quot;");
+  return s;
+}
+
+// ================== OLED MESSAGE ==================
+void oledMessage(String line1, String line2 = "", String line3 = "", String line4 = "") {
+  if (!oledOK) return;
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0, 0);
+  display.println(line1);
+
+  display.setCursor(0, 16);
+  display.println(line2);
+
+  display.setCursor(0, 32);
+  display.println(line3);
+
+  display.setCursor(0, 48);
+  display.println(line4);
+
+  display.display();
+}
+
+// ================== SD SEQUENCE ==================
+unsigned long readSequenceFromSD() {
+  if (!sdOK) return 0;
+  if (!SD.exists(SEQ_FILE)) return 0;
+
+  File f = SD.open(SEQ_FILE, FILE_READ);
+  if (!f) return 0;
+
+  String s = f.readStringUntil('\n');
+  f.close();
+
+  s.trim();
+  return s.toInt();
+}
+
+void saveSequenceToSD(unsigned long seq) {
+  if (!sdOK) return;
+
+  if (SD.exists(SEQ_FILE)) {
+    SD.remove(SEQ_FILE);
+  }
+
+  File f = SD.open(SEQ_FILE, FILE_WRITE);
+  if (!f) {
+    Serial.println("Khong ghi duoc seq.txt");
+    return;
+  }
+
+  f.println(seq);
+  f.close();
+}
+
+void createCSVHeaderIfNeeded() {
+  if (!sdOK) return;
+  if (SD.exists(DATA_FILE)) return;
+
+  File f = SD.open(DATA_FILE, FILE_WRITE);
+  if (!f) {
+    Serial.println("Khong tao duoc data.csv");
+    return;
+  }
+
+  f.println("No,Uptime_ms,Temp_C,Humidity_percent,Pressure_hPa,Lux,Full,IR,Visible,PM1_0,PM2_5,PM10,PMS_Status");
+  f.close();
+
+  Serial.println("Da tao data.csv");
+}
+
+// ================== TSL2591 CONFIG ==================
+void configureTSL2591() {
+  tsl.setGain(TSL2591_GAIN_LOW);                 // Best for outdoor bright light
+  tsl.setTiming(TSL2591_INTEGRATIONTIME_100MS);
+}
+
+// ================== PMS7003 READ ==================
+bool readPMS7003(PMSData &data, uint16_t timeoutMs = 300) {
+  uint8_t buffer[32];
+  uint32_t startTime = millis();
+
+  data.valid = false;
+  data.pm1_0 = 0;
+  data.pm2_5 = 0;
+  data.pm10 = 0;
+
+  while (millis() - startTime < timeoutMs) {
+    if (PMS.available() >= 32) {
+      if (PMS.peek() != 0x42) {
+        PMS.read();
+        continue;
+      }
+
+      PMS.readBytes(buffer, 32);
+
+      if (buffer[0] != 0x42 || buffer[1] != 0x4D) {
+        continue;
+      }
+
+      uint16_t frameLen = (buffer[2] << 8) | buffer[3];
+      if (frameLen != 28) {
+        continue;
+      }
+
+      uint16_t sum = 0;
+      for (int i = 0; i < 30; i++) {
+        sum += buffer[i];
+      }
+
+      uint16_t checksum = (buffer[30] << 8) | buffer[31];
+
+      if (sum != checksum) {
+        Serial.println("PMS checksum sai");
+        continue;
+      }
+
+      // Atmospheric environment values
+      data.pm1_0 = (buffer[10] << 8) | buffer[11];
+      data.pm2_5 = (buffer[12] << 8) | buffer[13];
+      data.pm10  = (buffer[14] << 8) | buffer[15];
+
+      data.valid = true;
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// ================== SENSOR READ ==================
+void readSensorsRealtime() {
+  if (bmeOK) {
+    curTemp = bme.readTemperature();
+    curHum  = bme.readHumidity();
+    curPres = bme.readPressure() / 100.0F;
+  }
+
+  if (tslOK) {
+    uint32_t lum = tsl.getFullLuminosity();
+
+    curIR = lum >> 16;
+    curFull = lum & 0xFFFF;
+
+    if (curFull >= curIR) {
+      curVisible = curFull - curIR;
+    } else {
+      curVisible = 0;
+    }
+
+    curLux = tsl.calculateLux(curFull, curIR);
+
+    if (isnan(curLux) || curLux < 0) {
+      curLux = -1;
+    }
+  }
+
+  PMSData tempPMS;
+  if (readPMS7003(tempPMS, 300)) {
+    curPMS = tempPMS;
+  }
+
+  lastSensorReadMs = millis();
+}
+
+// ================== OLED REALTIME SCROLL ==================
+void showOLEDRealtime() {
+  if (!oledOK) return;
+
+  String lines[OLED_TOTAL_LINES];
+
+  lines[0]  = "IP: " + WiFi.softAPIP().toString();
+  lines[1]  = "SSID: " + String(AP_SSID);
+  lines[2]  = "T: " + (isnan(curTemp) ? String("NA") : String(curTemp, 1)) + " C";
+  lines[3]  = "H: " + (isnan(curHum) ? String("NA") : String(curHum, 0)) + " %";
+  lines[4]  = "P: " + (isnan(curPres) ? String("NA") : String(curPres, 0)) + " hPa";
+  lines[5]  = "Lux: " + ((curLux < 0 || isnan(curLux)) ? String("NA") : String(curLux, 0));
+  lines[6]  = "Full: " + String(curFull);
+  lines[7]  = "IR: " + String(curIR);
+  lines[8]  = "Visible: " + String(curVisible);
+
+  if (curPMS.valid) {
+    lines[9]  = "PM1.0: " + String(curPMS.pm1_0);
+    lines[10] = "PM2.5: " + String(curPMS.pm2_5);
+    lines[11] = "PM10 : " + String(curPMS.pm10);
+  } else {
+    lines[9]  = "PM1.0: waiting";
+    lines[10] = "PM2.5: waiting";
+    lines[11] = "PM10 : waiting";
+  }
+
+  lines[12] = "SD: " + String(sdOK ? "OK" : "FAIL");
+  lines[13] = "Saved No: " + String(lastSavedNo);
+
+  unsigned long passed = millis() - lastLogTime;
+  unsigned long remain = 0;
+  if (passed < LOG_INTERVAL) {
+    remain = (LOG_INTERVAL - passed) / 1000;
+  }
+  lines[14] = "Next save: " + String(remain) + "s";
+
+  // Cuon tung dong sau moi OLED_SCROLL_INTERVAL
+  if (millis() - lastOledScrollTime >= OLED_SCROLL_INTERVAL) {
+    lastOledScrollTime = millis();
+    oledScrollLine++;
+
+    if (oledScrollLine > OLED_TOTAL_LINES - OLED_VISIBLE_LINES) {
+      oledScrollLine = 0;
+    }
+  }
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  for (int i = 0; i < OLED_VISIBLE_LINES; i++) {
+    int lineIndex = oledScrollLine + i;
+    display.setCursor(0, i * 10);
+    display.print(lines[lineIndex]);
+  }
+
+  display.display();
+}
+
+// ================== SERIAL ==================
+void printSerialRealtime() {
+  Serial.println("========== REALTIME ==========");
+
+  Serial.print("AP SSID: ");
+  Serial.println(AP_SSID);
+
+  Serial.print("IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  Serial.print("Temp: ");
+  Serial.print(curTemp);
+  Serial.println(" C");
+
+  Serial.print("Humidity: ");
+  Serial.print(curHum);
+  Serial.println(" %");
+
+  Serial.print("Pressure: ");
+  Serial.print(curPres);
+  Serial.println(" hPa");
+
+  Serial.print("Lux: ");
+  Serial.println(curLux);
+
+  Serial.print("Full: ");
+  Serial.print(curFull);
+  Serial.print(" | IR: ");
+  Serial.print(curIR);
+  Serial.print(" | Visible: ");
+  Serial.println(curVisible);
+
+  if (curPMS.valid) {
+    Serial.print("PM1.0: ");
+    Serial.print(curPMS.pm1_0);
+    Serial.print(" | PM2.5: ");
+    Serial.print(curPMS.pm2_5);
+    Serial.print(" | PM10: ");
+    Serial.println(curPMS.pm10);
+  } else {
+    Serial.println("PMS7003: waiting...");
+  }
+
+  Serial.print("SD: ");
+  Serial.println(sdOK ? "OK" : "FAIL");
+
+  Serial.print("Last saved No: ");
+  Serial.println(lastSavedNo);
+}
+
+// ================== SD LOG ==================
+void logDataToSD() {
+  if (!sdOK) {
+    Serial.println("SD FAIL, khong ghi duoc");
+    return;
+  }
+
+  sampleIndex++;
+
+  File f = SD.open(DATA_FILE, FILE_APPEND);
+  if (!f) {
+    Serial.println("Khong mo duoc data.csv");
+    return;
+  }
+
+  f.print(sampleIndex);
+  f.print(",");
+
+  f.print(millis());
+  f.print(",");
+
+  if (isnan(curTemp)) f.print("NA");
+  else f.print(curTemp, 2);
+  f.print(",");
+
+  if (isnan(curHum)) f.print("NA");
+  else f.print(curHum, 2);
+  f.print(",");
+
+  if (isnan(curPres)) f.print("NA");
+  else f.print(curPres, 2);
+  f.print(",");
+
+  if (curLux < 0 || isnan(curLux)) f.print("NA");
+  else f.print(curLux, 2);
+  f.print(",");
+
+  f.print(curFull);
+  f.print(",");
+
+  f.print(curIR);
+  f.print(",");
+
+  f.print(curVisible);
+  f.print(",");
+
+  if (curPMS.valid) {
+    f.print(curPMS.pm1_0);
+    f.print(",");
+    f.print(curPMS.pm2_5);
+    f.print(",");
+    f.print(curPMS.pm10);
+    f.print(",");
+    f.println("OK");
+  } else {
+    f.println("NA,NA,NA,FAIL");
+  }
+
+  f.close();
+
+  saveSequenceToSD(sampleIndex);
+  lastSavedNo = sampleIndex;
+
+  Serial.print("Da luu mau so ");
+  Serial.println(sampleIndex);
+}
+
+// ================== JSON API ==================
+String buildJsonData() {
+  String json = "{";
+
+  json += "\"uptime_ms\":" + String(millis()) + ",";
+  json += "\"ip\":\"" + WiFi.softAPIP().toString() + "\",";
+  json += "\"ssid\":\"" + String(AP_SSID) + "\",";
+  json += "\"bme_ok\":" + String(bmeOK ? "true" : "false") + ",";
+  json += "\"tsl_ok\":" + String(tslOK ? "true" : "false") + ",";
+  json += "\"sd_ok\":" + String(sdOK ? "true" : "false") + ",";
+  json += "\"oled_ok\":" + String(oledOK ? "true" : "false") + ",";
+  json += "\"pms_ok\":" + String(curPMS.valid ? "true" : "false") + ",";
+
+  json += "\"temp\":\"" + safeFloat(curTemp, 2) + "\",";
+  json += "\"hum\":\"" + safeFloat(curHum, 2) + "\",";
+  json += "\"pres\":\"" + safeFloat(curPres, 2) + "\",";
+  json += "\"lux\":\"" + luxString(curLux, 2) + "\",";
+
+  json += "\"full\":" + String(curFull) + ",";
+  json += "\"ir\":" + String(curIR) + ",";
+  json += "\"visible\":" + String(curVisible) + ",";
+
+  if (curPMS.valid) {
+    json += "\"pm1_0\":" + String(curPMS.pm1_0) + ",";
+    json += "\"pm2_5\":" + String(curPMS.pm2_5) + ",";
+    json += "\"pm10\":" + String(curPMS.pm10) + ",";
+  } else {
+    json += "\"pm1_0\":\"NA\",";
+    json += "\"pm2_5\":\"NA\",";
+    json += "\"pm10\":\"NA\",";
+  }
+
+  json += "\"last_saved_no\":" + String(lastSavedNo) + ",";
+  json += "\"next_save_in_s\":" + String((LOG_INTERVAL - (millis() - lastLogTime)) / 1000);
+
+  json += "}";
+
+  return json;
+}
+
+// ================== READ LAST CSV ROWS ==================
+String getLastCSVRows(uint16_t maxLines = 30) {
+  if (!sdOK || !SD.exists(DATA_FILE)) {
+    return "SD not ready or data.csv not found";
+  }
+
+  File f = SD.open(DATA_FILE, FILE_READ);
+  if (!f) {
+    return "Cannot open data.csv";
+  }
+
+  const size_t MAX_CHARS = 5000;
+  String content = "";
+
+  while (f.available()) {
+    char c = f.read();
+    content += c;
+
+    if (content.length() > MAX_CHARS) {
+      content.remove(0, content.length() - MAX_CHARS);
+    }
+  }
+
+  f.close();
+
+  // Keep only last maxLines lines
+  int lines = 0;
+  int cutIndex = 0;
+
+  for (int i = content.length() - 1; i >= 0; i--) {
+    if (content[i] == '\n') {
+      lines++;
+      if (lines > maxLines) {
+        cutIndex = i + 1;
+        break;
+      }
+    }
+  }
+
+  if (cutIndex > 0) {
+    content = content.substring(cutIndex);
+  }
+
+  return content;
+}
+
+// ================== WEB HTML ==================
+String buildMainPage() {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ESP32 Air Light Logger</title>
+<style>
+  body {
+    margin: 0;
+    font-family: Arial, sans-serif;
+    background: #f3f6fb;
+    color: #1f2937;
+  }
+  .wrap {
+    max-width: 960px;
+    margin: auto;
+    padding: 16px;
+  }
+  .header {
+    background: linear-gradient(135deg, #0ea5e9, #22c55e);
+    color: white;
+    padding: 18px;
+    border-radius: 18px;
+    margin-bottom: 16px;
+    box-shadow: 0 8px 20px rgba(0,0,0,0.12);
+  }
+  .header h1 {
+    margin: 0 0 8px 0;
+    font-size: 24px;
+  }
+  .header p {
+    margin: 4px 0;
+    font-size: 14px;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 12px;
+  }
+  .card {
+    background: white;
+    border-radius: 16px;
+    padding: 14px;
+    box-shadow: 0 6px 18px rgba(0,0,0,0.08);
+  }
+  .label {
+    color: #6b7280;
+    font-size: 13px;
+  }
+  .value {
+    font-size: 25px;
+    font-weight: 700;
+    margin-top: 6px;
+  }
+  .unit {
+    font-size: 13px;
+    color: #6b7280;
+  }
+  .status {
+    display: inline-block;
+    padding: 4px 9px;
+    border-radius: 999px;
+    font-size: 13px;
+    margin: 3px;
+  }
+  .ok {
+    background: #dcfce7;
+    color: #166534;
+  }
+  .fail {
+    background: #fee2e2;
+    color: #991b1b;
+  }
+  .actions {
+    margin: 16px 0;
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  a, button {
+    border: none;
+    background: #2563eb;
+    color: white;
+    padding: 10px 14px;
+    border-radius: 12px;
+    text-decoration: none;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button {
+    background: #16a34a;
+  }
+  pre {
+    background: #111827;
+    color: #d1d5db;
+    padding: 12px;
+    border-radius: 12px;
+    overflow: auto;
+    font-size: 12px;
+  }
+  .small {
+    font-size: 13px;
+    color: #4b5563;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="header">
+    <h1>ESP32 Air + Solar Light Logger</h1>
+    <p>Wi-Fi AP: <b id="ssid">...</b> | IP: <b id="ip">...</b></p>
+    <p class="small">OLED cập nhật realtime, MicroSD lưu CSV mỗi 5 phút.</p>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <div class="label">Nhiệt độ</div>
+      <div class="value"><span id="temp">--</span> <span class="unit">°C</span></div>
+    </div>
+    <div class="card">
+      <div class="label">Độ ẩm</div>
+      <div class="value"><span id="hum">--</span> <span class="unit">%</span></div>
+    </div>
+    <div class="card">
+      <div class="label">Áp suất</div>
+      <div class="value"><span id="pres">--</span> <span class="unit">hPa</span></div>
+    </div>
+    <div class="card">
+      <div class="label">Ánh sáng</div>
+      <div class="value"><span id="lux">--</span> <span class="unit">lux</span></div>
+    </div>
+    <div class="card">
+      <div class="label">PM1.0</div>
+      <div class="value"><span id="pm1">--</span> <span class="unit">µg/m³</span></div>
+    </div>
+    <div class="card">
+      <div class="label">PM2.5</div>
+      <div class="value"><span id="pm25">--</span> <span class="unit">µg/m³</span></div>
+    </div>
+    <div class="card">
+      <div class="label">PM10</div>
+      <div class="value"><span id="pm10">--</span> <span class="unit">µg/m³</span></div>
+    </div>
+    <div class="card">
+      <div class="label">Lần lưu cuối</div>
+      <div class="value"><span id="lastSaved">--</span></div>
+      <div class="small">Còn <span id="nextSave">--</span>s tới lần lưu tiếp theo</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:16px;">
+    <div class="label">Trạng thái module</div>
+    <div id="statusBox"></div>
+  </div>
+
+  <div class="actions">
+    <a href="/download">Tải data.csv</a>
+    <button onclick="loadLastRows()">Xem dòng CSV gần nhất</button>
+    <button onclick="refreshNow()">Cập nhật ngay</button>
+  </div>
+
+  <div class="card">
+    <div class="label">Dữ liệu CSV gần nhất</div>
+    <pre id="csvBox">Bấm nút "Xem dòng CSV gần nhất" để đọc dữ liệu từ thẻ nhớ.</pre>
+  </div>
+</div>
+
+<script>
+async function refreshNow() {
+  try {
+    const res = await fetch('/data');
+    const d = await res.json();
+
+    document.getElementById('ssid').textContent = d.ssid;
+    document.getElementById('ip').textContent = d.ip;
+
+    document.getElementById('temp').textContent = d.temp;
+    document.getElementById('hum').textContent = d.hum;
+    document.getElementById('pres').textContent = d.pres;
+    document.getElementById('lux').textContent = d.lux;
+
+    document.getElementById('pm1').textContent = d.pm1_0;
+    document.getElementById('pm25').textContent = d.pm2_5;
+    document.getElementById('pm10').textContent = d.pm10;
+
+    document.getElementById('lastSaved').textContent = d.last_saved_no;
+    document.getElementById('nextSave').textContent = d.next_save_in_s;
+
+    const status = [
+      ['BME280', d.bme_ok],
+      ['TSL2591', d.tsl_ok],
+      ['PMS7003', d.pms_ok],
+      ['OLED', d.oled_ok],
+      ['MicroSD', d.sd_ok]
+    ];
+
+    let html = '';
+    status.forEach(s => {
+      html += `<span class="status ${s[1] ? 'ok' : 'fail'}">${s[0]}: ${s[1] ? 'OK' : 'FAIL'}</span>`;
+    });
+    document.getElementById('statusBox').innerHTML = html;
+  } catch (e) {
+    console.log(e);
+  }
+}
+
+async function loadLastRows() {
+  try {
+    const res = await fetch('/last');
+    const txt = await res.text();
+    document.getElementById('csvBox').textContent = txt;
+  } catch (e) {
+    document.getElementById('csvBox').textContent = 'Không đọc được dữ liệu CSV.';
+  }
+}
+
+setInterval(refreshNow, 1000);
+refreshNow();
+</script>
+</body>
+</html>
+)rawliteral";
+
+  return html;
+}
+
+// ================== WEB HANDLERS ==================
+void handleRoot() {
+  server.send(200, "text/html; charset=utf-8", buildMainPage());
+}
+
+void handleData() {
+  // Read fresh data before sending web response
+  readSensorsRealtime();
+  server.send(200, "application/json", buildJsonData());
+}
+
+void handleLastRows() {
+  String content = getLastCSVRows(30);
+  server.send(200, "text/plain; charset=utf-8", content);
+}
+
+void handleDownload() {
+  if (!sdOK || !SD.exists(DATA_FILE)) {
+    server.send(404, "text/plain; charset=utf-8", "data.csv not found or SD not ready");
+    return;
+  }
+
+  File f = SD.open(DATA_FILE, FILE_READ);
+  if (!f) {
+    server.send(500, "text/plain; charset=utf-8", "Cannot open data.csv");
+    return;
+  }
+
+  server.streamFile(f, "text/csv");
+  f.close();
+}
+
+void handleNotFound() {
+  server.send(404, "text/plain; charset=utf-8", "404 Not Found");
+}
+
+void setupWebServer() {
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.on("/last", handleLastRows);
+  server.on("/download", handleDownload);
+  server.onNotFound(handleNotFound);
+  server.begin();
+
+  Serial.println("Web server started.");
+}
+
+// ================== SETUP ==================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println();
+  Serial.println("Khoi dong ESP32 Air Light Web Logger...");
+
+  curPMS.valid = false;
+
+  // ---------- I2C ----------
+  Wire.begin(I2C_SDA, I2C_SCL);
+  delay(100);
+
+  // ---------- OLED ----------
+  if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    oledOK = true;
+    Serial.println("OLED OK dia chi 0x3C");
+  } else if (display.begin(SSD1306_SWITCHCAPVCC, 0x3D)) {
+    oledOK = true;
+    Serial.println("OLED OK dia chi 0x3D");
+  } else {
+    oledOK = false;
+    Serial.println("Khong tim thay OLED");
+  }
+
+  if (oledOK) {
+    oledMessage("System starting", "ESP32 Web Logger", "Starting AP...", "");
+    delay(1000);
+  }
+
+  // ---------- WiFi AP ----------
+  WiFi.mode(WIFI_AP);
+  bool apOK = WiFi.softAP(AP_SSID, AP_PASS);
+
+  if (apOK) {
+    Serial.println("WiFi AP started.");
+    Serial.print("SSID: ");
+    Serial.println(AP_SSID);
+    Serial.print("PASS: ");
+    Serial.println(AP_PASS);
+    Serial.print("IP: ");
+    Serial.println(WiFi.softAPIP());
+  } else {
+    Serial.println("WiFi AP start FAILED.");
+  }
+
+  // ---------- PMS7003 ----------
+  PMS.begin(9600, SERIAL_8N1, PMS_RX, PMS_TX);
+  Serial.println("PMS7003 UART2 OK");
+
+  // ---------- BME280 ----------
+  if (bme.begin(0x76)) {
+    bmeOK = true;
+    Serial.println("BME280 OK 0x76");
+  } else if (bme.begin(0x77)) {
+    bmeOK = true;
+    Serial.println("BME280 OK 0x77");
+  } else {
+    bmeOK = false;
+    Serial.println("BME280 FAIL");
+  }
+
+  // ---------- TSL2591 ----------
+  if (tsl.begin()) {
+    tslOK = true;
+    Serial.println("TSL2591 OK");
+    configureTSL2591();
+  } else {
+    tslOK = false;
+    Serial.println("TSL2591 FAIL");
+  }
+
+  // ---------- MicroSD ----------
+  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+
+  if (SD.begin(SD_CS)) {
+    sdOK = true;
+    Serial.println("MicroSD OK");
+  } else {
+    sdOK = false;
+    Serial.println("MicroSD FAIL");
+  }
+
+  if (sdOK) {
+    createCSVHeaderIfNeeded();
+    sampleIndex = readSequenceFromSD();
+    lastSavedNo = sampleIndex;
+  }
+
+  // ---------- Web ----------
+  setupWebServer();
+
+  if (oledOK) {
+    oledMessage(
+      "AP: ESP32_AIR_LIGHT",
+      "Pass: 12345678",
+      "IP: " + WiFi.softAPIP().toString(),
+      sdOK ? "SD: OK" : "SD: FAIL"
+    );
+    delay(3000);
+  }
+
+  // First read + first save
+  readSensorsRealtime();
+  showOLEDRealtime();
+  printSerialRealtime();
+
+  logDataToSD();
+
+  lastDisplayTime = millis();
+  lastLogTime = millis();
+}
+
+// ================== LOOP ==================
+void loop() {
+  server.handleClient();
+
+  unsigned long now = millis();
+
+  // OLED + Serial + sensor update
+  if (now - lastDisplayTime >= DISPLAY_INTERVAL) {
+    lastDisplayTime = now;
+
+    readSensorsRealtime();
+    showOLEDRealtime();
+    printSerialRealtime();
+  }
+
+  // SD save every 5 minutes
+  if (now - lastLogTime >= LOG_INTERVAL) {
+    lastLogTime = now;
+    logDataToSD();
+  }
+}
